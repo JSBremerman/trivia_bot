@@ -1,19 +1,94 @@
-from typing import List, Optional
+import collections
+import logging
+from typing import Generator, List, Optional, Sequence, Tuple
 
-import pip._internal.utils.inject_securetransport  # noqa
-from pip._internal.utils import _log
+from pip._internal.utils.logging import indent_log
 
-# init_logging() must be called before any call to logging.getLogger()
-# which happens at import of most modules.
-_log.init_logging()
+from .req_file import parse_requirements
+from .req_install import InstallRequirement
+from .req_set import RequirementSet
+
+__all__ = [
+    "RequirementSet",
+    "InstallRequirement",
+    "parse_requirements",
+    "install_given_reqs",
+]
+
+logger = logging.getLogger(__name__)
 
 
-def main(args: (Optional[List[str]]) = None) -> int:
-    """This is preserved for old console scripts that may still be referencing
-    it.
+class InstallationResult:
+    def __init__(self, name: str) -> None:
+        self.name = name
 
-    For additional details, see https://github.com/pypa/pip/issues/7498.
+    def __repr__(self) -> str:
+        return f"InstallationResult(name={self.name!r})"
+
+
+def _validate_requirements(
+    requirements: List[InstallRequirement],
+) -> Generator[Tuple[str, InstallRequirement], None, None]:
+    for req in requirements:
+        assert req.name, f"invalid to-be-installed requirement: {req}"
+        yield req.name, req
+
+
+def install_given_reqs(
+    requirements: List[InstallRequirement],
+    install_options: List[str],
+    global_options: Sequence[str],
+    root: Optional[str],
+    home: Optional[str],
+    prefix: Optional[str],
+    warn_script_location: bool,
+    use_user_site: bool,
+    pycompile: bool,
+) -> List[InstallationResult]:
     """
-    from pip._internal.utils.entrypoints import _wrapper
+    Install everything in the given list.
 
-    return _wrapper(args)
+    (to be called after having downloaded and unpacked the packages)
+    """
+    to_install = collections.OrderedDict(_validate_requirements(requirements))
+
+    if to_install:
+        logger.info(
+            "Installing collected packages: %s",
+            ", ".join(to_install.keys()),
+        )
+
+    installed = []
+
+    with indent_log():
+        for req_name, requirement in to_install.items():
+            if requirement.should_reinstall:
+                logger.info("Attempting uninstall: %s", req_name)
+                with indent_log():
+                    uninstalled_pathset = requirement.uninstall(auto_confirm=True)
+            else:
+                uninstalled_pathset = None
+
+            try:
+                requirement.install(
+                    install_options,
+                    global_options,
+                    root=root,
+                    home=home,
+                    prefix=prefix,
+                    warn_script_location=warn_script_location,
+                    use_user_site=use_user_site,
+                    pycompile=pycompile,
+                )
+            except Exception:
+                # if install did not succeed, rollback previous uninstall
+                if uninstalled_pathset and not requirement.install_succeeded:
+                    uninstalled_pathset.rollback()
+                raise
+            else:
+                if uninstalled_pathset and requirement.install_succeeded:
+                    uninstalled_pathset.commit()
+
+            installed.append(InstallationResult(req_name))
+
+    return installed
